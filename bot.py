@@ -80,12 +80,14 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
+    # Важно: если у вас уже есть users таблица с day, то это не изменит существующие строки.
+    # Я рекомендую выполнить миграцию для перевода значений day (если нужно) на новую семантику (1..30).
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         chat_id BIGINT PRIMARY KEY,
-        day INTEGER DEFAULT 0,
+        day INTEGER DEFAULT 1,
         streak INTEGER DEFAULT 0,
         last_done DATE,
         achievements TEXT[] DEFAULT '{}',
@@ -103,80 +105,100 @@ init_db()
 def init_user(chat_id, username=None):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
-    user = cur.fetchone()
-    if not user:
-        cur.execute("INSERT INTO users (chat_id, username) VALUES (%s, %s)", (chat_id, username))
-        conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
+        user = cur.fetchone()
+        if not user:
+            # day = 1 по умолчанию — первый день программы
+            cur.execute("INSERT INTO users (chat_id, username, day) VALUES (%s, %s, %s)", (chat_id, username, 1))
+            conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 def get_user(chat_id):
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-    return user
+    try:
+        cur.execute("SELECT * FROM users WHERE chat_id = %s", (chat_id,))
+        user = cur.fetchone()
+        return user
+    finally:
+        cur.close()
+        conn.close()
 
 def update_user(chat_id, **kwargs):
+    if not kwargs:
+        return
     conn = get_db()
     cur = conn.cursor()
-    fields = ", ".join([f"{k} = %s" for k in kwargs.keys()])
-    values = list(kwargs.values())
-    values.append(chat_id)
-    cur.execute(f"UPDATE users SET {fields} WHERE chat_id = %s", tuple(values))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        fields = ", ".join([f"{k} = %s" for k in kwargs.keys()])
+        values = list(kwargs.values())
+        values.append(chat_id)
+        cur.execute(f"UPDATE users SET {fields} WHERE chat_id = %s", tuple(values))
+        conn.commit()
+    finally:
+        cur.close()
+        conn.close()
 
 # 🔄 Получить задание
 def get_task(user):
-    if user['day'] < len(TASKS):
-        return TASKS[user['day']]
-    return "🎉 Программа завершена! Ты прошёл 30 дней 🚀"
+    # user['day'] рассматриваем как номер дня (1..30)
+    day = user.get('day') or 1
+    idx = max(0, min(len(TASKS)-1, day-1))
+    return TASKS[idx]
 
 # 🎯 Проверка достижений
 def check_achievements(user):
     unlocked = []
+    current_streak = user.get('streak') or 0
+    existing = user.get('achievements') or []
     for threshold, text in ACHIEVEMENTS.items():
-        if user['streak'] >= threshold and (user['achievements'] is None or str(threshold) not in user['achievements']):
-            new_achievements = (user['achievements'] or []) + [str(threshold)]
+        str_threshold = str(threshold)
+        if current_streak >= threshold and str_threshold not in existing:
+            new_achievements = existing + [str_threshold]
             update_user(user['chat_id'], achievements=new_achievements)
             unlocked.append(text)
+            existing = new_achievements  # обновляем локально, чтобы не дублировать
     return unlocked
 
-# ⏩ Следующее задание
+# ⏩ Следующее задание (пользователь нажал "Выполнено")
 def next_task(user):
-    today = datetime.now().date()
-    last_done = user['last_done']
-    streak = user['streak']
+    today = datetime.utcnow().date()
+    # можно считать last_done в UTC или по вашей логике; тут используем UTC для единообразия
+    last_done = user.get('last_done')
+    streak = user.get('streak') or 0
 
     if last_done:
         if today == last_done + timedelta(days=1):
             streak += 1
         elif today == last_done:
+            # повторно нажали в тот же день — не меняем серию
             pass
         else:
             streak = 1
     else:
         streak = 1
 
-    new_day = user['day'] + 1 if user['day'] < len(TASKS) else user['day']
+    current_day = user.get('day') or 1
+    new_day = current_day + 1 if current_day < len(TASKS) else current_day
     update_user(user['chat_id'], day=new_day, streak=streak, last_done=today)
     user = get_user(user['chat_id'])
     return get_task(user), check_achievements(user), user
 
 # 🖲 Кнопки
 def get_inline_keyboard(user):
+    if not user:
+        # защищаемся на случай, если user отсутствует
+        user = {'subscribed': False}
     keyboard = types.InlineKeyboardMarkup(row_width=2)  # Две кнопки в строке
     buttons = [
         ("📅 Сегодня", "today"),
         ("✅ Выполнено", "next"),
         ("📊 Статистика", "stats"),
         ("ℹ Помощь", "help"),
-        ("❌ Отписаться" if user['subscribed'] else "🔔 Подписаться", "unsubscribe" if user['subscribed'] else "subscribe")
+        ("❌ Отписаться" if user.get('subscribed') else "🔔 Подписаться", "unsubscribe" if user.get('subscribed') else "subscribe")
     ]
     # Первые четыре кнопки по парам
     keyboard.add(
@@ -193,7 +215,7 @@ def get_inline_keyboard(user):
     )
     return keyboard
 
-# 🚀 /start
+# ▶️ /start
 @bot.message_handler(commands=['start'])
 def start(message):
     init_user(message.chat.id, message.from_user.username)
@@ -209,11 +231,16 @@ def start(message):
 @bot.message_handler(commands=['stats'])
 def stats(message):
     user = get_user(message.chat.id)
-    ach_list = [ACHIEVEMENTS[int(x)].split(" ")[0] for x in (user['achievements'] or []) if int(x) in ACHIEVEMENTS]
-    ach_text = "🎯 Достижения: " + (" ".join(ach_list) if ach_list else "пока нет")
+    ach_list = []
+    for x in (user.get('achievements') or []):
+        try:
+            ach_list.append(ACHIEVEMENTS.get(int(x), ""))
+        except Exception:
+            pass
+    ach_text = "🎯 Достижения:\n" + ("\n".join(ach_list) if ach_list else "пока нет")
     bot.send_message(
         message.chat.id,
-        f"📊 Статистика:\n📅 День: {user['day']}/{len(TASKS)}\n🔥 Серия: {user['streak']} дней подряд\n{ach_text}",
+        f"📊 Статистика:\n📅 День: {user.get('day')}/{len(TASKS)}\n🔥 Серия: {user.get('streak') or 0} дней подряд\n{ach_text}",
         reply_markup=get_inline_keyboard(user)
     )
 
@@ -226,10 +253,12 @@ def all_stats(message):
 
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users ORDER BY day DESC;")
-    users = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute("SELECT * FROM users ORDER BY day DESC;")
+        users = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
 
     if not users:
         bot.send_message(message.chat.id, "Нет пользователей.")
@@ -237,8 +266,8 @@ def all_stats(message):
 
     text = "👥 Статистика по всем пользователям:\n"
     for u in users:
-        uname = f"@{u['username']}" if u['username'] else u['chat_id']
-        text += f"- {uname}: день {u['day']}, серия {u['streak']} дней\n"
+        uname = f"@{u['username']}" if u.get('username') else u['chat_id']
+        text += f"- {uname}: день {u.get('day')}, серия {u.get('streak')} дней\n"
     bot.send_message(message.chat.id, text)
 
 # 🎛 Обработка кнопок
@@ -259,23 +288,28 @@ def handle_inline_buttons(call):
 
     elif data == "next":
         task, achievements, user = next_task(user)
-        text = f"➡ Следующее задание:\n{task}\n\n🔥 Серия: {user['streak']} дней\n📅 День {user['day']}/{len(TASKS)}"
+        text = f"➡ Следующее задание:\n{task}\n\n🔥 Серия: {user.get('streak')} дней\n📅 День {user.get('day')}/{len(TASKS)}"
         bot.send_message(chat_id, text, reply_markup=get_inline_keyboard(user))
         for ach in achievements:
             bot.send_message(chat_id, f"🎉 {ach}")
 
     elif data == "stats":
-        ach_list = [ACHIEVEMENTS[int(x)].split(" ")[0] for x in (user['achievements'] or []) if int(x) in ACHIEVEMENTS]
-        ach_text = "🎯 Достижения: " + (" ".join(ach_list) if ach_list else "пока нет")
+        ach_list = []
+        for x in (user.get('achievements') or []):
+            try:
+                ach_list.append(ACHIEVEMENTS.get(int(x), ""))
+            except Exception:
+                pass
+        ach_text = "🎯 Достижения:\n" + ("\n".join(ach_list) if ach_list else "пока нет")
         bot.send_message(
             chat_id,
-            f"📊 Статистика:\n📅 День: {user['day']}/{len(TASKS)}\n🔥 Серия: {user['streak']} дней подряд\n{ach_text}",
+            f"📊 Статистика:\n📅 День: {user.get('day')}/{len(TASKS)}\n🔥 Серия: {user.get('streak') or 0} дней подряд\n{ach_text}",
             reply_markup=get_inline_keyboard(user)
         )
 
     elif data == "subscribe":
         update_user(chat_id, subscribed=True)
-        bot.send_message(chat_id, "✅ Напоминания включены! Буду писать в 09:00 каждый день.", reply_markup=get_inline_keyboard(get_user(chat_id)))
+        bot.send_message(chat_id, "✅ Напоминания включены! Буду писать в установленное время.", reply_markup=get_inline_keyboard(get_user(chat_id)))
 
     elif data == "unsubscribe":
         update_user(chat_id, subscribed=False)
@@ -288,7 +322,7 @@ def handle_inline_buttons(call):
             "📅 — показать задание на сегодня\n"
             "✅ — отметить выполнение\n"
             "📊 — статистика\n"
-            "🔔 — подписка на напоминания (09:00)\n\n"
+            "🔔 — подписка на напоминания\n\n"
             "🎯 Выполняя задания подряд, ты будешь получать достижения!",
             reply_markup=get_inline_keyboard(user)
         )
@@ -300,20 +334,26 @@ def schedule_checker():
         time.sleep(30)
 
 def send_scheduled_task():
+    """
+    Отправляет напоминание о текущем задании подписчикам, но НЕ помечает задание как выполненное.
+    Это критично: автоматические напоминания не должны менять состояние пользователя.
+    """
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE subscribed = TRUE;")
-    subs = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute("SELECT * FROM users WHERE subscribed = TRUE;")
+        subs = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
 
     for user in subs:
         try:
-            task, achievements, user = next_task(user)
-            text = f"📌 Автоматическое напоминание:\n{task}\n\n🔥 Серия: {user['streak']} дней\n📅 День {user['day']}/{len(TASKS)}"
+            # НЕ вызываем next_task здесь! Только показываем текущее задание
+            task = get_task(user)
+            text = f"📌 Автоматическое напоминание:\n{task}\n\n"
+            text += "Если выполнил(а) — нажми ✅ в боте, чтобы отметить."
             bot.send_message(user['chat_id'], text, reply_markup=get_inline_keyboard(user))
-            for ach in achievements:
-                bot.send_message(user['chat_id'], f"🎉 {ach}")
         except Exception as e:
             logging.error(f"Error in scheduled task for {user['chat_id']}: {e}")
 
@@ -331,9 +371,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/webhook":
-            length = int(self.headers['content-length'])
+            length = int(self.headers.get('content-length', 0))
             body = self.rfile.read(length)
-            update = telebot.types.Update.de_json(body.decode("utf-8"))
+            try:
+                update = telebot.types.Update.de_json(body.decode("utf-8"))
+            except Exception as e:
+                logging.error(f"Failed to parse update body: {e}")
+                self.send_response(400)
+                self.end_headers()
+                return
 
             # 📝 Логируем апдейты
             if update.message:
@@ -369,7 +415,8 @@ if __name__ == '__main__':
     bot.set_webhook(url=WEBHOOK_URL)
     logging.info(f"🔗 Webhook установлен: {WEBHOOK_URL}")
 
-    schedule.every().day.at("09:00").do(send_scheduled_task)
+    REMINDER_HOUR = os.getenv("REMINDER_HOUR", "09:00")  # формат HH:MM, по умолчанию 09:00
+    schedule.every().day.at(REMINDER_HOUR).do(send_scheduled_task)
     threading.Thread(target=schedule_checker, daemon=True).start()
 
     start_web_server()
